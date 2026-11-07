@@ -6,12 +6,19 @@
 
 import json
 import random
+from datetime import datetime, timedelta, timezone
 from functools import cache
 from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 MAX_RESULTS = 3
 
+# 第3回 宿題（実装）: 学習の記録の保存先。.gitignore 済みなので commit されない
+LOG_DIR = Path(__file__).resolve().parent.parent / "learning_log"
+MAX_TITLE_CHARS = 60
+MAX_LOG_CHARS = 2000
+# Codespaces の時計は UTC なので、日本時間に固定する
+JST = timezone(timedelta(hours=9), "JST")
 
 @cache
 def load_glossary() -> list[dict]:
@@ -99,3 +106,29 @@ def make_quiz(lecture: int) -> str:
         ensure_ascii=False,
     )
 
+def save_learning_log(title: str, content: str) -> str:
+    """学習の記録を learning_log/ フォルダに保存する（今日の日付のファイルに追記する）。
+
+    利用者が「今日の学びを記録して」「この説明をメモに残して」のように、
+    記録を残すことをはっきり頼んだときだけ使う。頼まれていないときは使わない。
+    title には見出しを短く（例: "LoRAとQLoRAの違い"）、content には残す内容を
+    箇条書きで簡潔にまとめて入れる。保存の前に、利用者の承認を求める。
+    """
+    title = " ".join(title.split())  # 改行や連続した空白を1つにして、見出しを1行にする
+    content = content.strip()
+    if not title or not content:
+        return "title と content の両方が必要です。保存していません。"
+    if len(title) > MAX_TITLE_CHARS:
+        return f"title が長すぎます（{len(title)}字、上限{MAX_TITLE_CHARS}字）。短くしてください。保存していません。"
+    if len(content) > MAX_LOG_CHARS:
+        return f"content が長すぎます（{len(content)}字、上限{MAX_LOG_CHARS}字）。要点にまとめてください。保存していません。"
+
+    now = datetime.now(JST)
+    # ファイル名は日付だけで決める。モデルが作る文字列をパスに使わないので、
+    # 「../」などで learning_log/ の外へ書き込まれることがない
+    path = LOG_DIR / f"{now:%Y-%m-%d}.md"
+    LOG_DIR.mkdir(exist_ok=True)
+    # 追記（"a"）なので、前の記録を上書きしない
+    with path.open("a", encoding="utf-8") as f:
+        f.write(f"## {now:%H:%M} {title}\n\n{content}\n\n")
+    return f"learning_log/{path.name} に「{title}」を保存しました。"

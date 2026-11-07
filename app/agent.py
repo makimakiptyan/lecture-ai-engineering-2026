@@ -5,6 +5,8 @@
     uv run python -m app.agent --trace "LoRAとQLoRAの違いは？"   # ツール呼び出しを表示
     uv run python -m app.agent --mcp --trace "LoRAとは？"        # 第5回: ツールを MCP サーバーから受け取る
     uv run python -m app.agent --mcp --list-tools               # 第5回: モデルに見えるツール一覧（APIキー不要）
+    uv run python -m app.agent --trace "LoRAとQLoRAの違いは？"   # ツール呼び出しを表示
+    uv run python -m app.agent --trace "LoRAとQLoRAの違いを調べて、学習ログに保存して"  # 宿題: 保存の前に承認を求める
 
 エージェント = モデル + ループ + ツール。
 モデルは tools.py の関数を「ツール」として呼び出し、その結果を見て回答を作る。
@@ -15,8 +17,9 @@ import argparse
 import inspect
 import json
 from pathlib import Path
+from typing import Callable
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults, ToolDenied
 from pydantic_ai.exceptions import ModelHTTPError
 from fastmcp import Client
 from pydantic_ai.mcp import MCPToolset, StdioTransport
@@ -33,18 +36,24 @@ INSTRUCTIONS = """\
 - 用語や講座に固有のことを答える前に、必ず search_glossary で用語集を確認する。
 - 回の内容を聞かれたら get_lecture_summary を使う。
 - 確認問題を求められたら make_quiz を使い、問題だけを出す。答えは利用者が回答してから示す。
+- 学習の記録を残すよう頼まれたら save_learning_log を使う。頼まれていないときは保存しない。
 - 用語集に見つからないことは、推測で断定せず「用語集にはない」と伝える。
 - 回答の最後に、関係する回（第N回）を示す。
 - 宿題の答えそのものは書かず、考え方のヒントで導く。
 """
 
 # モデルは実行時に渡す（テストではAPIを呼ばない TestModel に差し替えるため）
-agent = Agent(instructions=INSTRUCTIONS)
+# 承認待ちで止まると、結果（result.output）が文字列ではなく DeferredToolRequests になる。
+# output_type に加えておかないと、登録はできるが、モデルが承認付きのツールを呼んだ時点で UserError になる
+agent = Agent(instructions=INSTRUCTIONS, output_type=[str, DeferredToolRequests])
 agent.tool_plain(tools.search_glossary)
 agent.tool_plain(tools.get_lecture_summary)
 
 # TODO(第3回 演習): tools.py に make_quiz を作り、ここで登録しよう
 agent.tool_plain(tools.make_quiz)
+
+# 第3回 宿題（実装）: ファイルへの書き込みは取り消しにくいので、実行の前に利用者の承認を求める
+agent.tool_plain(tools.save_learning_log, requires_approval=True)
 
 # 第5回: 使う MCP サーバーの設定ファイル。Claude Desktop や Cursor と同じ "mcpServers" 形式
 MCP_CONFIG = Path(__file__).resolve().parent / "mcp_servers.json"
@@ -110,6 +119,49 @@ def print_trace(result) -> None:
                 print(f"[tool return] {part.tool_name} -> {str(part.content)[:120]}…")
     print(f"[usage] {result.usage}")
 
+def ask_approvals(requests: DeferredToolRequests, ask: Callable[[str], str] = input) -> DeferredToolResults:
+    """第3回 宿題（実装）: 承認待ちのツール呼び出しを1件ずつ利用者に見せ、実行してよいかを聞く。
+
+    y（yes）のときだけ承認する。それ以外の入力や、入力できない環境（EOF）では断る。
+    断ったときは ToolDenied の文がツールの結果としてモデルに渡り、モデルはそれを見て回答を続ける。
+    ask はテストで差し替えられるように引数にしている。
+    """
+    results = DeferredToolResults()
+    for call in requests.approvals:
+        print(f"\n[承認待ち] {call.tool_name}")
+        for key, value in call.args_as_dict().items():
+            print(f"  {key}: " + str(value).replace("\n", "\n    "))  # 複数行の内容は字下げして読みやすく
+        try:
+            answer = ask("この内容で実行しますか？ [y/N]: ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() in ("y", "yes"):
+            results.approvals[call.tool_call_id] = True
+        else:
+            results.approvals[call.tool_call_id] = ToolDenied(
+                "利用者が実行を断りました。実行していないことを利用者に伝えてください。"
+            )
+    return results
+
+
+def run_with_approval(target: Agent, question: str, model, ask: Callable[[str], str] = input):
+    """質問を実行し、承認待ちで止まったら利用者に聞いて、その結果を渡して続きを実行する。
+
+    続きの実行には、それまでの会話（message_history）と承認の結果（deferred_tool_results）を渡す。
+    usage も引き継ぐので、--trace の [usage] は承認の前後を合わせた LLM の呼び出し回数になる。
+    続きの中でまた承認付きのツールが呼ばれることもあるので、止まらなくなるまで繰り返す。
+    """
+    result = target.run_sync(question, model=model)
+    while isinstance(result.output, DeferredToolRequests):
+        approvals = ask_approvals(result.output, ask)
+        result = target.run_sync(
+            message_history=result.all_messages(),
+            deferred_tool_results=approvals,
+            model=model,
+            usage=result.usage,
+        )
+    return result
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="学習支援エージェントに質問する")
@@ -130,7 +182,7 @@ def main() -> None:
     if args.mcp:
         print("[tools] MCP サーバー（app/mcp_servers.json）")
     try:
-        result = target.run_sync(args.question, model=build_model())
+        result = run_with_approval(target, args.question, build_model())
     except ModelHTTPError as e:
         print(api_error_message(e.status_code, str(e.body)[:200]))
         raise SystemExit(1)
