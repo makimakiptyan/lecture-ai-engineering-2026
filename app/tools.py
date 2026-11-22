@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from functools import cache
 from pathlib import Path
 
+from app.config import api_error_message
+
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 MAX_RESULTS = 3
 
@@ -86,6 +88,58 @@ def get_lecture_summary(lecture: int) -> str:
         return f"第{lecture}回の要点はまだありません。用意されている回: {', '.join(available)}"
     return path.read_text(encoding="utf-8")
 
+
+def search_materials(query: str) -> str:
+    """第1〜3回の本講義資料を検索し、関連ページの本文・タイトル・ページ番号を返す。
+
+    queryに調べたい内容を指定する。
+    """
+    from google.genai.errors import APIError
+    import sqlite3
+    from app import config
+    from app.retrieval import search, search_with_neighbors
+
+    try:
+        # 第5回 宿題（実装）: AIE_RAG_NEIGHBORS=1 のときだけ前後ページも付ける。説明文（docstring）は変えない
+        window = config.RAG_NEIGHBOR_WINDOW
+        results = search_with_neighbors(query, window) if window > 0 else search(query)
+        return json.dumps({"results": results}, ensure_ascii=False)
+    except (ValueError, FileNotFoundError, sqlite3.Error) as e:
+        return json.dumps({"error": str(e), "results": []}, ensure_ascii=False)
+    except APIError as e:
+        return json.dumps({"error": api_error_message(e.code), "results": []}, ensure_ascii=False)
+
+
+def browse_tree(node_id: str | None = None) -> str:
+    """目次とページの先頭文を返す。ページIDを指定すると全文を返す。
+
+    最初はnode_idを省略する。続いて返されたIDを指定して目次をたどる。
+    """
+    from app.retrieval import browse_tree as browse
+
+    try:
+        return json.dumps(browse(node_id), ensure_ascii=False)
+    except (ValueError, OSError) as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+def search_graph(query: str) -> str:
+    """資料を検索し、前後ページ・共通用語をたどって関連ページの本文と引用情報を返す。
+
+    queryに調べたい内容を指定する。
+    """
+    import sqlite3
+    from google.genai.errors import APIError
+    from app.retrieval import search_graph as search
+
+    try:
+        return json.dumps(search(query), ensure_ascii=False)
+    except (ValueError, OSError, sqlite3.Error) as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+    except APIError as e:
+        return json.dumps({"error": api_error_message(e.code)}, ensure_ascii=False)
+
+
 def make_quiz(lecture: int) -> str:
     """指定した回（1始まりの整数）の用語から確認問題を1問作り、問題と答えを返す。
 
@@ -94,7 +148,7 @@ def make_quiz(lecture: int) -> str:
     返り値の answer は採点用なので、利用者が答えるまでは見せない。
     """
     terms = [e for e in load_glossary() if e["lecture"] == lecture]
-    if not terms:  # 第0回など、用語が無い回（pytest はこれで呼ぶ）
+    if not terms:
         available = sorted({e["lecture"] for e in load_glossary()})
         return (
             f"第{lecture}回の用語は用語集にありません。"
