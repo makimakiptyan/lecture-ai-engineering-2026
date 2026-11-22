@@ -163,6 +163,20 @@ def print_trace(result, elapsed_seconds: float | None = None) -> None:
                                 print(f"      {child['content']}")
                         if not data["children"]:
                             print(f"    （末端ページ・本文{len(node.get('content', ''))}文字を取得）")
+                elif part.tool_name == "search_materials":
+                    # 第5回 宿題（実装）: 返したページを1行ずつ出し、前後として足したページと区別する
+                    data = json.loads(part.content)
+                    results = data.get("results", [])
+                    chars = sum(len(r.get("content", "")) for r in results)
+                    print(f"[tool return] search_materials -> {len(results)}ページ（本文 計{chars:,}文字）")
+                    if "error" in data:
+                        print(f"    エラー: {data['error']}")
+                    for i, r in enumerate(results, 1):
+                        if r.get("match") == "neighbor":
+                            kind = f"前後 {r['offset']:+d}（{r['neighbor_of']} の隣）"
+                        else:
+                            kind = f"検索 {r.get('rank', i)}位 距離{r['distance']:.3f}"
+                        print(f"    - 第{r['lecture']}回 PDF p.{r['page']} [{kind}] {r['title']}")
                 else:
                     print(f"[tool return] {part.tool_name} -> {str(part.content)[:120]}…")
     usage = result.usage
